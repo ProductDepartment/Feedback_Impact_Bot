@@ -1,5 +1,7 @@
 import os
 import asyncio
+from logging import Logger
+
 import aiohttp
 from dotenv import load_dotenv
 import logging
@@ -7,9 +9,11 @@ import sqlite3
 from datetime import datetime, timedelta
 import json
 from notion_client import Client
+from datetime import datetime
+
 
 # Настройка логирования
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Загрузка переменных окружения
@@ -19,6 +23,11 @@ NOTION_API_KEY = os.getenv("NOTION_API_KEY")
 NOTION_MEETINGS_DB_ID = os.getenv("NOTION_MEETINGS_DB_ID")
 NOTION_FEEDBACK_DB_ID = os.getenv("NOTION_FEEDBACK_DB_ID")
 ERROR_CHAT_ID = os.getenv("ERROR_CHAT_ID")
+
+logger.info(f"TELEGRAM_TOKEN: {TELEGRAM_TOKEN}")
+logger.info(f"NOTION_API_KEY: {NOTION_API_KEY}")
+logger.info(f"NOTION_MEETINGS_DB_ID: {NOTION_MEETINGS_DB_ID}")
+logger.info(datetime.now().isoformat())
 
 # Константы
 POLLING_INTERVAL = 60 * 60 * 8   # 8 часов в секундах
@@ -53,6 +62,7 @@ class FeedbackBot:
                 )
             """)
             conn.commit()
+            logger.info("База данных успешно инициализирована")
 
     # async def start(self):
     #     """Запуск бота"""
@@ -94,19 +104,45 @@ class FeedbackBot:
             async with session.post(
                     f"https://api.notion.com/v1/databases/{NOTION_MEETINGS_DB_ID}/query",
                     headers=headers,
-                    json=payload
+                    json=payload,
+                    allow_redirects=True
             ) as response:
                 data = await response.json()
                 return data.get('results', [])
 
     async def process_meeting(self, meeting):
-        properties = meeting['properties']
-        meeting_id = meeting['id']
-        meeting_name = properties['Name']['title'][0]['text']['content']
-        mentor_relation = properties['Mentor(s)']['relation'][0]['id']
+        properties = meeting.get('properties', {})  # Безопасный доступ к properties
+        meeting_id = meeting.get('id', '')
+
+        # Извлечение meeting_name
+        title_list = properties.get('Name', {}).get('title', [])
+        if not title_list or 'text' not in title_list[0]:
+            logger.error(f"Отсутствует название встречи для meeting_id {meeting_id}")
+            return
+        meeting_name = title_list[0]['text']['content']
+
+        # Извлечение mentor_relatio
+        properties = meeting.get('properties', {})
+        logger.debug(f"Свойства встречи для meeting_id {meeting_id}: {properties}")
+        mentor_relation_list = properties.get('Mentor(s)', {}).get('relation', [])
+        if not mentor_relation_list:
+            logger.error(f"Отсутствует ментор для meeting_id {meeting_id}")
+            return
+        mentor_relation = mentor_relation_list[0]['id']
         mentor_name = await self.get_notion_page_name(mentor_relation)
-        student_id = properties['Student']['relation'][0]['id']
-        chat_id_array = properties['TG_CHAT_ID']['rollup']['array']
+
+        # Извлечение student_id
+        student_relation_list = properties.get('Student', {}).get('relation', [])
+        if not student_relation_list:
+            logger.error(f"Отсутствует студент для meeting_id {meeting_id}")
+            return
+        student_id = student_relation_list[0]['id']
+
+        # Извлечение chat_id
+        chat_id_array = properties.get('TG_CHAT_ID', {}).get('rollup', {}).get('array', [])
+        if not chat_id_array:
+            logger.error(f"Отсутствует TG_CHAT_ID для meeting_id {meeting_id}")
+            return
         chat_id = str(chat_id_array[0]['number'])
 
         if self.is_meeting_processed(meeting_id):
@@ -128,20 +164,24 @@ class FeedbackBot:
         # Отмечаем встречу как обработанную
         self.mark_meeting_processed(meeting_id)
 
-
-
     async def get_notion_page_name(self, page_id):
-        """Получение имени страницы Notion по ID"""
         headers = {
             "Authorization": f"Bearer {NOTION_API_KEY}",
             "Notion-Version": "2022-06-28"
         }
         async with aiohttp.ClientSession() as session:
             async with session.get(
-                f"https://api.notion.com/v1/pages/{page_id}",
-                headers=headers
+                    f"https://api.notion.com/v1/pages/{page_id}",
+                    headers=headers
             ) as response:
                 data = await response.json()
+                logger.debug(f"Ответ от Notion API для page_id {page_id}: {data}")
+                if response.status != 200:
+                    logger.error(f"Ошибка API Notion: статус {response.status}, данные: {data}")
+                    raise Exception(f"Ошибка API Notion: {data.get('message', 'Неизвестная ошибка')}")
+                if 'properties' not in data or 'Name' not in data['properties']:
+                    logger.error(f"Неверный ответ для page_id {page_id}")
+                    raise KeyError("Неверный ответ Notion API для страницы")
                 return data['properties']['Name']['title'][0]['text']['content']
 
     def is_meeting_processed(self, meeting_id):
@@ -180,7 +220,7 @@ class FeedbackBot:
             }]]
         }
         message_text = (
-            f"Пожалуйста, оставьте обратную связь по встрече:\n"
+            f"Пожалуйста, оставьте обратную связь по встрече:\n\n"
             f"<b>{meeting_name}</b> с ментором {mentor_name}."
         )
         message = await self.send_telegram_message(chat_id, message_text, keyboard)
@@ -252,11 +292,12 @@ class FeedbackBot:
     def get_question_text(self, question_num):
         """Получение текста вопроса"""
         questions = [
-            "Насколько продуктивно была проведена встреча со стороны ментора?",
-            "Насколько быстро ментор отвечает на ваши вопросы?",
-            "Насколько вам понятен план действий до следующей встречи?",
-            "Оцените уровень экспертизы ментора по основной теме встречи.",
-            "Насколько быстро и эффективно ваш координатор помогает вам?"
+            "Оцените, насколько полезной была сегодняшняя встреча? \n(1 – не полезно, 2 – многое непонятно, 3 – нужно больше примеров, 4 – очень полезно, 5 – максимальная польза)",
+            "Насколько быстро ментор Вам отвечает на ваши вопросы и обращения в рабочее время? \n(1 – несколько дней, 2 – через день, 3 – медленно отвечает, 4 – отвечает своевременно, 5 – отвечает быстро)",
+            "Насколько Вам понятен план действий до следующей встречи? \n(1 – слишком сложно, 2 – сложно, 3 – с усилием понятно, 4 – оптимально, 5 – очень легко)",
+            "Насколько эффективно Ваш трекер помогает Вам с решением ваших вопросов и проблем? \n(1 – не помог, 2 – иногда помогал, 3 – нормально, 4 – хорошо, 5 – отлично!)",
+            "Оцените уровень экспертизы ментора по основной теме встречи. \n(1 – низкий уровень, 2 – ниже среднего, 3 – средний уровень, 4 – выше среднего, 5 – высокий уровень)",
+            "Насколько занятие помогло вам продвинуться к поступлению и была ли информация полезной? \n(1 – не пригодится, 2 – мало практики, 3 – полезно, 4 – хорошая подготовка, 5 – отлично!)"
         ]
         return questions[question_num - 1]
 
@@ -274,7 +315,7 @@ class FeedbackBot:
                 logger.info(f"Сохранен ответ на вопрос {question_num}: {points} для meeting_id {meeting_id}")
 
                 next_question = current_question + 1
-                total_questions = 5
+                total_questions = 6
                 if next_question <= total_questions:
                     conn.execute(
                         "UPDATE questionnaires SET answers = ?, current_question = ? WHERE chat_id = ? AND meeting_id = ?",
@@ -293,7 +334,7 @@ class FeedbackBot:
                     # Получаем Summary из Notion
                     summary = await self.get_meeting_summary(meeting_id)
 
-                    await self.edit_telegram_message(chat_id, message_id, f"Спасибо за обратную связь! \nSummary встречи:\n{summary}")
+                    await self.edit_telegram_message(chat_id, message_id, f"Спасибо за обратную связь!\n\n{summary}")
                     await self.save_feedback_to_notion(chat_id, meeting_id, answers)
                     await self.mark_notion_meeting_completed(meeting_id)
 
@@ -332,11 +373,12 @@ class FeedbackBot:
             "properties": {
                 "Meeting": {"relation": [{"id": meeting_id}]},
                 "Student": {"relation": [{"id": student_id}]},
-                "[1] MEETING PRODUCTIVITY": {"number": answers.get('1', 0)},
-                "[2] RESPONSE SPEED": {"number": answers.get('2', 0)},
-                "[3] PLAN UNDERSTANDING": {"number": answers.get('3', 0)},
-                "[4] EXPERTISE": {"number": answers.get('4', 0)},
-                "[5] EFFECTIVENESS (TRACKER)": {"number": answers.get(5, 0)},
+                "[1] USEFULNESS": {"number": answers.get('1', 0)},
+                "[2] QUICK RESPONSE": {"number": answers.get('2', 0)},
+                "[3] MATERIAL UNDERSTANDING": {"number": answers.get('3', 0)},
+                "[4] TRACKER": {"number": answers.get('4', 0)},
+                "[5] EXPERTISE": {"number": answers.get('5', 0)},
+                "[6] IMPROVEMENT": {"number": answers.get(6, 0)},
                 "Filler Name": {"rich_text": [{"text": {"content": "BOT"}}]},
                 "Date": {"date": {"start": datetime.now().isoformat()}},
                 "Meeting Name": {"title": [{"text": {"content": meeting_name}}]},
@@ -371,7 +413,9 @@ class FeedbackBot:
 
     async def run_notion_checker(self):
         """Фоновая проверка завершенных встреч"""
+
         while True:
+            logger.info("Начало проверки встреч в Notion")
             try:
                 meetings = await self.fetch_notion_meetings()
                 logger.info(f"Найдено {len(meetings)} встреч для обработки")
@@ -379,7 +423,9 @@ class FeedbackBot:
                     await self.process_meeting(meeting)
             except Exception as e:
                 logger.error(f"Ошибка в notion_checker: {e}")
+            logger.info("Конец проверки встреч в Notion")
             await asyncio.sleep(POLLING_INTERVAL)
+
 
     async def run_reminder_checker(self):
         """Фоновая отправка напоминаний"""
@@ -394,7 +440,6 @@ class FeedbackBot:
                     for chat_id, meeting_id, meeting_name, last_message_id in pending:
                         if last_message_id:
                             await self.delete_telegram_message(chat_id, last_message_id)
-
                         # Получаем имя ментора из Notion по meeting_id
                         mentor_name = await self.get_mentor_name_from_notion(meeting_id)
 
@@ -411,7 +456,6 @@ class FeedbackBot:
             await asyncio.sleep(REMINDER_INTERVAL)
 
     async def get_mentor_name_from_notion(self, meeting_id):
-        """Получение имени ментора из Notion по meeting_id"""
         headers = {
             "Authorization": f"Bearer {NOTION_API_KEY}",
             "Notion-Version": "2022-06-28"
@@ -422,7 +466,13 @@ class FeedbackBot:
                     headers=headers
             ) as response:
                 data = await response.json()
-                # Извлекаем ID ментора из свойства 'Mentor(s)' и получаем его имя
+                logger.debug(f"Ответ от Notion API для meeting_id {meeting_id}: {data}")
+                if response.status != 200:
+                    logger.error(f"Ошибка API Notion: статус {response.status}, данные: {data}")
+                    raise Exception(f"Ошибка API Notion: {data.get('message', 'Неизвестная ошибка')}")
+                if 'properties' not in data:
+                    logger.error(f"Ключ 'properties' отсутствует в ответе для meeting_id {meeting_id}")
+                    raise KeyError("'properties' не найден в ответе Notion API")
                 mentor_relation = data['properties']['Mentor(s)']['relation'][0]['id']
                 mentor_name = await self.get_notion_page_name(mentor_relation)
                 return mentor_name
@@ -455,13 +505,16 @@ class FeedbackBot:
                 await asyncio.sleep(5)  # Задержка перед повторной попыткой
 
     async def get_telegram_updates(self, offset):
-        """Получение обновлений от Telegram"""
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
         params = {'offset': offset, 'timeout': 30}
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params) as response:
-                data = await response.json()
-                return data.get('result', [])
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params) as response:
+                    data = await response.json()
+                    return data.get('result', [])
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logger.error(f"Ошибка при получении обновлений от Telegram: {e}")
+            return []  # Возвращаем пустой список, чтобы цикл продолжился
 
     async def get_meeting_summary(self, meeting_id):
         headers = {
