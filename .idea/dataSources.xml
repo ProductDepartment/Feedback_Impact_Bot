@@ -1,11 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="DataSourceManagerImpl" format="xml" multifile-model="true">
-    <data-source source="LOCAL" name="feedback" uuid="53634f50-a632-4d14-a8b0-44b44cabb560">
+    <data-source source="LOCAL" name="feedback" uuid="36c4d7fc-7918-4dba-8877-2d89c8ea198d">
       <driver-ref>sqlite.xerial</driver-ref>
       <synchronize>true</synchronize>
       <jdbc-driver>org.sqlite.JDBC</jdbc-driver>
-      <jdbc-url>jdbc:sqlite:C:\Users\nurga\OneDrive\Рабочий стол\Impact\Feedback_bot\feedback.db</jdbc-url>
+      <jdbc-url>jdbc:sqlite:C:\Users\nurga\OneDrive\Рабочий стол\Impact\feedbackBotProject\feedback.db</jdbc-url>
       <working-dir>$ProjectFileDir$</working-dir>
       <libraries>
         <library>
