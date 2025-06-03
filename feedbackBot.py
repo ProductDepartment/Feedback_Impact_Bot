@@ -11,34 +11,38 @@ from notion_client import Client
 from datetime import datetime
 import random
 
+class DBWorker:
+    def __init__(self, db_path="feedback.db"):
+        self.db_path = db_path
+        self.queue = asyncio.Queue()
+        self.worker_task = None
 
-# Настройка логирования
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+    async def start(self):
+        self.worker_task = asyncio.create_task(self.worker())
 
-# Загрузка переменных окружения
-load_dotenv()
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-NOTION_API_KEY = os.getenv("NOTION_API_KEY")
-NOTION_MEETINGS_DB_ID = os.getenv("NOTION_MEETINGS_DB_ID")
-NOTION_FEEDBACK_DB_ID = os.getenv("NOTION_FEEDBACK_DB_ID")
-ERROR_CHAT_ID = os.getenv("ERROR_CHAT_ID")
+    async def worker(self):
+        while True:
+            func, args, kwargs, future = await self.queue.get()
+            try:
+                result = func(self.db_path, *args, **kwargs)
+                if future:
+                    future.set_result(result)
+            except Exception as e:
+                if future:
+                    future.set_exception(e)
+            self.queue.task_done()
 
+    async def execute(self, func, *args, **kwargs):
+        loop = asyncio.get_event_loop()
+        future = loop.create_future()
+        await self.queue.put((func, args, kwargs, future))
+        return await future
 
-
-# Константы
-POLLING_INTERVAL = 60 * 60 * 2   # 2 часов в секундах
-REMINDER_INTERVAL = 20 * 60 * 8  # 8 часов в секундах
-
-class FeedbackBot:
-    def __init__(self):
-        self.notion = Client(auth=NOTION_API_KEY)
-        self.init_database()
-        logger.info("Бот инициализирован")
-
-    def init_database(self):
+    # Методы для работы с базой данных
+    @staticmethod
+    def _init_database(db_path):
         """Инициализация базы данных SQLite"""
-        with sqlite3.connect("feedback.db") as conn:
+        with sqlite3.connect(db_path) as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS questionnaires (
                     chat_id TEXT,
@@ -60,13 +64,203 @@ class FeedbackBot:
                     meeting_id TEXT PRIMARY KEY
                 )
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS chat_ids_db (
+                    chat_id TEXT PRIMARY KEY
+                )
+            """)
             conn.commit()
-            logger.info("База данных успешно инициализирована")
 
+    @staticmethod
+    def _is_meeting_processed(db_path, meeting_id):
+        """Проверка, обработана ли встреча"""
+        with sqlite3.connect(db_path) as conn:
+            cursor = conn.execute(
+                "SELECT 1 FROM processed_meetings WHERE meeting_id = ?",
+                (meeting_id,)
+            )
+            return cursor.fetchone() is not None
+
+    @staticmethod
+    def _mark_meeting_processed(db_path, meeting_id):
+        """Отметка встречи как обработанной"""
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "INSERT INTO processed_meetings (meeting_id) VALUES (?)",
+                (meeting_id,)
+            )
+            conn.commit()
+
+    @staticmethod
+    def _save_questionnaire(db_path, chat_id, meeting_id, meeting_name, student_id):
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("""
+                INSERT INTO questionnaires 
+                (chat_id, meeting_id, meeting_name, student_id, status, current_question, answers, created_at)
+                VALUES (?, ?, ?, ?, 'pending', 0, '{}', ?)
+            """, (chat_id, meeting_id, meeting_name, student_id, datetime.now().isoformat()))
+            conn.commit()
+
+    @staticmethod
+    def _update_last_message_id(db_path, chat_id, meeting_id, message_id):
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "UPDATE questionnaires SET last_message_id = ? WHERE chat_id = ? AND meeting_id = ?",
+                (message_id, chat_id, meeting_id)
+            )
+            conn.commit()
+
+    @staticmethod
+    def _delete_questionnaire(db_path, chat_id, meeting_id):
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "DELETE FROM questionnaires WHERE chat_id = ? AND meeting_id = ?",
+                (chat_id, meeting_id)
+            )
+            conn.commit()
+
+    @staticmethod
+    def _get_meeting_for_start(db_path, chat_id):
+        with sqlite3.connect(db_path) as conn:
+            cursor = conn.execute(
+                "SELECT meeting_id FROM questionnaires WHERE chat_id = ? AND status = 'pending' LIMIT 1",
+                (chat_id,)
+            )
+            row = cursor.fetchone()
+            return row[0] if row else None
+
+    @staticmethod
+    def _start_questionnaire_update(db_path, chat_id, meeting_id, user_id, user_nickname):
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "UPDATE questionnaires SET status = 'in_progress', current_question = 1, started_by = ?, filler_nickname = ? WHERE chat_id = ? AND meeting_id = ?",
+                (user_id, user_nickname, chat_id, meeting_id)
+            )
+            conn.commit()
+
+    @staticmethod
+    def _get_questionnaire_data(db_path, chat_id):
+        with sqlite3.connect(db_path) as conn:
+            cursor = conn.execute(
+                "SELECT meeting_id, answers, current_question, started_by, meeting_name, filler_nickname FROM questionnaires WHERE chat_id = ? AND status = 'in_progress'",
+                (chat_id,)
+            )
+            return cursor.fetchone()
+
+    @staticmethod
+    def _update_questionnaire_answer(db_path, chat_id, meeting_id, answers_json, next_question, is_completed):
+        with sqlite3.connect(db_path) as conn:
+            if is_completed:
+                conn.execute(
+                    "UPDATE questionnaires SET answers = ?, status = 'completed', current_question = ? WHERE chat_id = ? AND meeting_id = ?",
+                    (answers_json, next_question, chat_id, meeting_id)
+                )
+            else:
+                conn.execute(
+                    "UPDATE questionnaires SET answers = ?, current_question = ? WHERE chat_id = ? AND meeting_id = ?",
+                    (answers_json, next_question, chat_id, meeting_id)
+                )
+            conn.commit()
+
+    @staticmethod
+    def _get_questionnaire_for_feedback(db_path, chat_id, meeting_id):
+        with sqlite3.connect(db_path) as conn:
+            cursor = conn.execute(
+                "SELECT student_id, meeting_name, filler_nickname FROM questionnaires WHERE chat_id = ? AND meeting_id = ?",
+                (chat_id, meeting_id)
+            )
+            return cursor.fetchone()
+
+    @staticmethod
+    def _delete_completed_questionnaire(db_path, meeting_id):
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "DELETE FROM questionnaires WHERE meeting_id = ?",
+                (meeting_id,)
+            )
+            conn.commit()
+
+    @staticmethod
+    def _get_pending_questionnaires(db_path):
+        with sqlite3.connect(db_path) as conn:
+            cursor = conn.execute(
+                "SELECT chat_id, meeting_id, meeting_name, last_message_id FROM questionnaires WHERE status in ('pending', 'in_progress')"
+            )
+            return cursor.fetchall()
+
+    @staticmethod
+    def _reset_questionnaire(db_path, chat_id, meeting_id, message_id):
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "UPDATE questionnaires SET started_by = NULL, filler_nickname = NULL, status = 'pending', answers = '{}', last_message_id = ? WHERE chat_id = ? AND meeting_id = ?",
+                (message_id, chat_id, meeting_id)
+            )
+            conn.commit()
+
+    @staticmethod
+    def _get_all_chat_ids(db_path):
+        with sqlite3.connect(db_path) as conn:
+            cursor = conn.execute("SELECT chat_id FROM chat_ids_db")
+            return [row[0] for row in cursor.fetchall()]
+
+    @staticmethod
+    def _save_chat_id(db_path, chat_id):
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO chat_ids_db (chat_id)
+                VALUES (?)
+                ON CONFLICT(chat_id) DO UPDATE SET chat_id=excluded.chat_id
+                """,
+                (chat_id,)
+            )
+            conn.commit()
+
+    @staticmethod
+    def _get_meeting_date(db_path, meeting_name):
+        with sqlite3.connect(db_path) as conn:
+            cursor = conn.execute(
+                "SELECT meeting_id FROM questionnaires WHERE meeting_name = ?",
+                (meeting_name,)
+            )
+            row = cursor.fetchone()
+            return row[0] if row else None
+
+# Настройка логирования
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Загрузка переменных окружения
+load_dotenv()
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+NOTION_API_KEY = os.getenv("NOTION_API_KEY")
+NOTION_MEETINGS_DB_ID = os.getenv("NOTION_MEETINGS_DB_ID")
+NOTION_FEEDBACK_DB_ID = os.getenv("NOTION_FEEDBACK_DB_ID")
+ERROR_CHAT_ID = os.getenv("ERROR_CHAT_ID")
+ERRORLOG_CHAT_ID = os.getenv("ERRORLOG_CHAT_ID")
+
+
+
+# Константы
+POLLING_INTERVAL = 60 * 60 * 5   # 8 часов в секундах
+REMINDER_INTERVAL = 60 * 60 * 8  # 8 часов в секундах
+
+class FeedbackBot:
+    def __init__(self):
+        self.notion = Client(auth=NOTION_API_KEY)
+        self.db_worker = DBWorker()
+        logger.info("Бот инициализирован")
+
+    async def init_database(self):
+        """Инициализация базы данных SQLite"""
+        await self.db_worker.execute(DBWorker._init_database)
+        logger.info("База данных успешно инициализирована")
 
     async def start(self):
         """Запуск бота с фоновыми задачами"""
         logger.info("Запуск бота")
+        await self.db_worker.start()
+        await self.init_database()
         tasks = [
             asyncio.create_task(self.run_notion_checker()),
             asyncio.create_task(self.run_reminder_checker()),
@@ -81,7 +275,7 @@ class FeedbackBot:
             "Content-Type": "application/json"
         }
         today = datetime.now().isoformat()
-        fourteen_days_ago = (datetime.now() - timedelta(days=14)).isoformat()
+        fourteen_days_ago = (datetime.now() - timedelta(days=1)).isoformat()
 
         payload = {
             "filter": {
@@ -108,6 +302,9 @@ class FeedbackBot:
                         if response.status != 200:
                             error_text = await response.text()
                             logger.error(f"Notion API вернул ошибку: {response.status}, текст: {error_text}")
+                            await self.send_telegram_message(ERRORLOG_CHAT_ID,
+                                                             f"Error when receiving meeting data: \n {response.status}, text: {error_text}")
+
                             return []
 
                         content_type = response.headers.get('Content-Type', '')
@@ -122,10 +319,11 @@ class FeedbackBot:
                 logger.error(f"Попытка {attempt + 1}/{retries} завершилась ошибкой: {e}")
                 if attempt == retries - 1:
                     logger.error("Все попытки исчерпаны, возвращаем пустой список")
+                    await self.send_telegram_message(ERRORLOG_CHAT_ID, "Error when receiving meeting data: \n " + str(e))
                     return []
                 await asyncio.sleep(2 ** attempt)  # Экспоненциальная задержка
 
-    async def process_meeting(self, meeting):
+    async def process_meeting(self, meeting, error_meeting_ids):
         properties = meeting.get('properties', {})  # Безопасный доступ к properties
         meeting_id = meeting.get('id', '')
 
@@ -133,6 +331,7 @@ class FeedbackBot:
         title_list = properties.get('Name', {}).get('title', [])
         if not title_list or 'text' not in title_list[0]:
             logger.error(f"Отсутствует название встречи для meeting_id {meeting_id}")
+            await self.send_telegram_message(ERRORLOG_CHAT_ID, f"Отсутствует название встречи для meeting_id {meeting_id}")
             return
         meeting_name = title_list[0]['text']['content']
 
@@ -141,6 +340,7 @@ class FeedbackBot:
         mentor_relation_list = properties.get('Mentor(s)', {}).get('relation', [])
         if not mentor_relation_list:
             logger.error(f"Отсутствует ментор для meeting_id {meeting_id}")
+            await self.send_telegram_message(ERRORLOG_CHAT_ID, f"Отсутствует ментор для meeting_id {meeting_id}")
             return
         mentor_relation = mentor_relation_list[0]['id']
         mentor_name = await self.get_notion_page_name(mentor_relation)
@@ -149,6 +349,7 @@ class FeedbackBot:
         student_relation_list = properties.get('Student', {}).get('relation', [])
         if not student_relation_list:
             logger.error(f"Отсутствует студент для meeting_id {meeting_id}")
+            await self.send_telegram_message(ERRORLOG_CHAT_ID, f"Отсутствует студент для meeting_id {meeting_id}")
             return
         student_id = student_relation_list[0]['id']
 
@@ -156,39 +357,31 @@ class FeedbackBot:
         chat_id_array = properties.get('TG_CHAT_ID', {}).get('rollup', {}).get('array', [])
         if not chat_id_array:
             logger.error(f"Отсутствует TG_CHAT_ID для meeting_id {meeting_id}")
+            await self.send_telegram_message(ERRORLOG_CHAT_ID, f"Отсутствует студент для meeting_id {meeting_id}")
             return
         chat_id = str(chat_id_array[0]['number'])
 
-        if self.is_meeting_processed(meeting_id):
+        if await self.is_meeting_processed(meeting_id):
             return
 
         # Сохраняем анкету
-        self.save_questionnaire(chat_id, meeting_id, meeting_name, mentor_name, student_id)
+        await self.save_questionnaire(chat_id, meeting_id, meeting_name, mentor_name, student_id)
         logger.info(f"Сохранена новая анкета для chat_id {chat_id}, meeting_id {meeting_id}")
 
         # Отправляем начальное сообщение с обработкой ошибок
         try:
             message_id = await self.send_initial_message(chat_id, meeting_name, mentor_name)
-            with sqlite3.connect("feedback.db") as conn:
-                conn.execute(
-                    "UPDATE questionnaires SET last_message_id = ? WHERE chat_id = ? AND meeting_id = ?",
-                    (message_id, chat_id, meeting_id)
-                )
-                conn.commit()
+            await self.db_worker.execute(DBWorker._update_last_message_id, chat_id, meeting_id, message_id)
         except Exception as e:
             logger.error(
                 f"Ошибка при отправке начального сообщения для chat_id {chat_id}, meeting_id {meeting_id}: {e}")
+            error_meeting_ids.append(f"<a href='https://www.notion.so/impactadmissions/{meeting_id.replace('-', '')}'>{meeting_name}</a>")
             # Удаляем запись из базы данных в случае ошибки
-            with sqlite3.connect("feedback.db") as conn:
-                conn.execute(
-                    "DELETE FROM questionnaires WHERE chat_id = ? AND meeting_id = ?",
-                    (chat_id, meeting_id)
-                )
-                conn.commit()
+            await self.db_worker.execute(DBWorker._delete_questionnaire, chat_id, meeting_id)
             return
 
         # Отмечаем встречу как обработанную
-        self.mark_meeting_processed(meeting_id)
+        await self.mark_meeting_processed(meeting_id)
 
     async def get_notion_page_name(self, page_id):
         headers = {
@@ -204,38 +397,26 @@ class FeedbackBot:
                 #logger.debug(f"Ответ от Notion API для page_id {page_id}: {data}")
                 if response.status != 200:
                     logger.error(f"Ошибка API Notion: статус {response.status}, данные: {data}")
+                    await self.send_telegram_message(ERRORLOG_CHAT_ID,
+                                                     f"Ошибка API Notion: статус {response.status}, данные: {data}")
                     raise Exception(f"Ошибка API Notion: {data.get('message', 'Неизвестная ошибка')}")
                 if 'properties' not in data or 'Name' not in data['properties']:
                     logger.error(f"Неверный ответ для page_id {page_id}")
+                    await self.send_telegram_message(ERRORLOG_CHAT_ID,
+                                                     f"Неверный ответ для page_id {page_id}")
                     raise KeyError("Неверный ответ Notion API для страницы")
                 return data['properties']['Name']['title'][0]['text']['content']
 
-    def is_meeting_processed(self, meeting_id):
+    async def is_meeting_processed(self, meeting_id):
         """Проверка, обработана ли встреча"""
-        with sqlite3.connect("feedback.db") as conn:
-            cursor = conn.execute(
-                "SELECT 1 FROM processed_meetings WHERE meeting_id = ?",
-                (meeting_id,)
-            )
-            return cursor.fetchone() is not None
+        return await self.db_worker.execute(DBWorker._is_meeting_processed, meeting_id)
 
-    def mark_meeting_processed(self, meeting_id):
+    async def mark_meeting_processed(self, meeting_id):
         """Отметка встречи как обработанной"""
-        with sqlite3.connect("feedback.db") as conn:
-            conn.execute(
-                "INSERT INTO processed_meetings (meeting_id) VALUES (?)",
-                (meeting_id,)
-            )
-            conn.commit()
+        await self.db_worker.execute(DBWorker._mark_meeting_processed, meeting_id)
 
-    def save_questionnaire(self, chat_id, meeting_id, meeting_name, mentor_name, student_id):
-        with sqlite3.connect("feedback.db") as conn:
-            conn.execute("""
-                INSERT INTO questionnaires 
-                (chat_id, meeting_id, meeting_name, student_id, status, current_question, answers, created_at)
-                VALUES (?, ?, ?, ?, 'pending', 0, '{}', ?)
-            """, (chat_id, meeting_id, meeting_name, student_id, datetime.now().isoformat()))
-            conn.commit()
+    async def save_questionnaire(self, chat_id, meeting_id, meeting_name, mentor_name, student_id):
+        await self.db_worker.execute(DBWorker._save_questionnaire, chat_id, meeting_id, meeting_name, student_id)
 
     async def send_initial_message(self, chat_id, meeting_name, mentor_name):
         """Отправка начального сообщения с кнопкой 'Начать'"""
@@ -271,17 +452,11 @@ class FeedbackBot:
             str: Дата встречи в формате, возвращаемом Notion API (например, "2025-02-23"),
                  или None, если дата не найдена или произошла ошибка.
         """
-        # Подключаемся к базе данных SQLite и ищем meeting_id по meeting_name
-        with sqlite3.connect("feedback.db") as conn:
-            cursor = conn.execute(
-                "SELECT meeting_id FROM questionnaires WHERE meeting_name = ?",
-                (meeting_name,)
-            )
-            row = cursor.fetchone()
-            if not row:
-                logger.error(f"Встреча с названием {meeting_name} не найдена в базе данных")
-                return None
-            meeting_id = row[0]
+        # Ищем meeting_id по meeting_name
+        meeting_id = await self.db_worker.execute(DBWorker._get_meeting_date, meeting_name)
+        if not meeting_id:
+            logger.error(f"Встреча с названием {meeting_name} не найдена в базе данных")
+            return None
 
         # Формируем заголовки для запроса к Notion API
         headers = {
@@ -351,22 +526,12 @@ class FeedbackBot:
 
     async def start_questionnaire(self, chat_id, meeting_name, message_id, user_id, user_nickname):
         """Начало анкеты: отправка первого вопроса"""
-        with sqlite3.connect("feedback.db") as conn:
-            cursor = conn.execute(
-                "SELECT meeting_id FROM questionnaires WHERE chat_id = ? AND status = 'pending' LIMIT 1",
-                (chat_id,)
-            )
-            row = cursor.fetchone()
-            if row:
-                meeting_id = row[0]
-                conn.execute(
-                    "UPDATE questionnaires SET status = 'in_progress', current_question = 1, started_by = ?, filler_nickname = ? WHERE chat_id = ? AND meeting_id = ?",
-                    (user_id, user_nickname, chat_id, meeting_id)
-                )
-                conn.commit()
-                keyboard = self.generate_question_keyboard(1, chat_id, meeting_id)
-                question_text = self.get_question_text(1)
-                await self.edit_telegram_message(chat_id, message_id, question_text, keyboard)
+        meeting_id = await self.db_worker.execute(DBWorker._get_meeting_for_start, chat_id)
+        if meeting_id:
+            await self.db_worker.execute(DBWorker._start_questionnaire_update, chat_id, meeting_id, user_id, user_nickname)
+            keyboard = self.generate_question_keyboard(1, chat_id, meeting_id)
+            question_text = self.get_question_text(1)
+            await self.edit_telegram_message(chat_id, message_id, question_text, keyboard)
 
     def update_questionnaire_status(self, chat_id, meeting_id, status, current_question):
         """Обновление статуса анкеты"""
@@ -399,79 +564,59 @@ class FeedbackBot:
         return questions[question_num - 1]
 
     async def process_answer(self, chat_id, question_num, points, message_id, user_id, callback_query_id):
-        with (sqlite3.connect("feedback.db") as conn):
-            cursor = conn.execute(
-                "SELECT meeting_id, answers, current_question, started_by, meeting_name, filler_nickname FROM questionnaires WHERE chat_id = ? AND status = 'in_progress'",
-                (chat_id,)
-            )
-            row = cursor.fetchone()
-            if row:
-                meeting_id, answers_json, current_question, started_by, meeting_name, filler_nickname = row
-                if str(user_id) != started_by:
-                    alert_text = f"You are not the person filling in the questionnaire {filler_nickname}"
-                    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery"
-                    payload = {
-                        'callback_query_id': callback_query_id,
-                        'text': alert_text,
-                        'show_alert': True
-                    }
-                    async with aiohttp.ClientSession() as session:
-                        async with session.post(url, json=payload) as response:
-                            await response.json()
-                    return
-                answers = json.loads(answers_json) if answers_json else {}
-                answers[question_num] = points
-                logger.info(f"Сохранен ответ на вопрос {question_num}: {points} для meeting_id {meeting_id}")
+        # Получаем данные текущей анкеты
+        row = await self.db_worker.execute(DBWorker._get_questionnaire_data, chat_id)
+        if row:
+            meeting_id, answers_json, current_question, started_by, meeting_name, filler_nickname = row
 
-                next_question = current_question + 1
-                total_questions = 6
-                if next_question <= total_questions:
-                    conn.execute(
-                        "UPDATE questionnaires SET answers = ?, current_question = ? WHERE chat_id = ? AND meeting_id = ?",
-                        (json.dumps(answers), next_question, chat_id, meeting_id)
-                    )
-                    conn.commit()
-                    keyboard = self.generate_question_keyboard(next_question, chat_id, meeting_id)
-                    question_text = self.get_question_text(next_question)
-                    await self.edit_telegram_message(chat_id, message_id, question_text, keyboard)
+            # Проверяем, является ли пользователь инициатором анкеты
+            if str(user_id) != started_by:
+                alert_text = f"You are not the person filling in the questionnaire {filler_nickname}"
+                url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery"
+                payload = {
+                    'callback_query_id': callback_query_id,
+                    'text': alert_text,
+                    'show_alert': True
+                }
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(url, json=payload) as response:
+                        await response.json()
+                return
+
+            # Обрабатываем ответ
+            answers = json.loads(answers_json) if answers_json else {}
+            answers[question_num] = points
+            logger.info(f"Сохранен ответ на вопрос {question_num}: {points} для meeting_id {meeting_id}")
+
+            # Определяем следующий вопрос
+            next_question = current_question + 1
+            total_questions = 6
+
+            # Обновляем базу данных в зависимости от прогресса
+            is_completed = next_question > total_questions
+            await self.db_worker.execute(DBWorker._update_questionnaire_answer, 
+                                       chat_id, meeting_id, json.dumps(answers), next_question, is_completed)
+
+            # Логика после успешного обновления базы данных
+            if next_question <= total_questions:
+                keyboard = self.generate_question_keyboard(next_question, chat_id, meeting_id)
+                question_text = self.get_question_text(next_question)
+                await self.edit_telegram_message(chat_id, message_id, question_text, keyboard)
+            else:
+                summary = await self.get_meeting_summary(meeting_id)
+                mentor_name = await self.get_mentor_name_from_notion(meeting_id)
+                emojis = ["😊", "😄", "😃", "😆", "😇", "😉", "🤩", "🥳", "😍", "🥰", "🙂", "🤗"]
+                random_emoji = random.choice(emojis)
+
+                # Формируем финальное сообщение
+                if summary and ("No content" not in summary and len(summary) > 50):
+                    summary = f"📄 Meeting Summary\n————————\n{summary}"
                 else:
-                    conn.execute(
-                        "UPDATE questionnaires SET answers = ?, status = 'completed', current_question = ? WHERE chat_id = ? AND meeting_id = ?",
-                        (json.dumps(answers), next_question, chat_id, meeting_id)
-                    )
-                    conn.commit()
-                    summary = await self.get_meeting_summary(meeting_id)
-
-                    emojis = [
-                        "😊",  # Улыбающееся лицо
-                        "😄",  # Широкая улыбка
-                        "😃",  # Радостное лицо
-                        "😆",  # Смеющееся лицо
-                        "😇",  # Ангельское лицо
-                        "😉",  # Подмигивающее лицо
-                        "🤩",  # Звездные глаза
-                        "🥳",  # Праздничное лицо
-                        "😍",  # Влюбленные глаза
-                        "🥰",  # Влюбленное лицо
-                        "🙂",  # Слегка улыбающееся лицо
-                        "🤗"  # Обнимающее лицо
-                    ]
-                    random_emoji = random.choice(emojis)  # Выбираем случайный смайлик
-                    # Добавляем получение имени ментора
-                    mentor_name = await self.get_mentor_name_from_notion(meeting_id)
-                    summary = await self.get_meeting_summary(meeting_id)
-                    if summary is not None and (
-                            ("No content" not in summary or len(summary) > 50) and len(summary) > 0):
-                        summary = f"📄 Meeting Summary\n————————\n{summary}"
-                    else:
-                        summary = ""
-                    final_message = f"Вы успешно заполнили анкету обратной связи на встречу {meeting_name} с ментором {mentor_name}! Спасибо, что ответили на все вопросы {random_emoji}\n\n<b>>> Заполнил(-а): {filler_nickname}</b> \n\n{summary}"
-                    await self.edit_telegram_message(chat_id, message_id, final_message)
-                    await self.save_feedback_to_notion(chat_id, meeting_id, answers)
-                    await self.mark_notion_meeting_completed(meeting_id)
-
-
-
+                    summary = ""
+                final_message = f"Вы успешно заполнили анкету обратной связи на встречу {meeting_name} с ментором {mentor_name}! Спасибо, что ответили на все вопросы {random_emoji}\n\n<b>>> Заполнил(-а): {filler_nickname}</b> \n\n{summary}"
+                await self.edit_telegram_message(chat_id, message_id, final_message)
+                await self.save_feedback_to_notion(chat_id, meeting_id, answers)
+                await self.mark_notion_meeting_completed(meeting_id)
 
     async def edit_telegram_message(self, chat_id, message_id, text, keyboard=None):
         """Редактирование сообщения в Telegram"""
@@ -489,16 +634,11 @@ class FeedbackBot:
                 return await response.json()
 
     async def save_feedback_to_notion(self, chat_id, meeting_id, answers):
-        with sqlite3.connect("feedback.db") as conn:
-            cursor = conn.execute(
-                "SELECT student_id, meeting_name, filler_nickname FROM questionnaires WHERE chat_id = ? AND meeting_id = ?",
-                (chat_id, meeting_id)
-            )
-            row = cursor.fetchone()
-            if not row:
-                logger.error(f"Анкета для chat_id {chat_id} и meeting_id {meeting_id} не найдена")
-                return
-            student_id, meeting_name, filler_nickname = row
+        row = await self.db_worker.execute(DBWorker._get_questionnaire_for_feedback, chat_id, meeting_id)
+        if not row:
+            logger.error(f"Анкета для chat_id {chat_id} и meeting_id {meeting_id} не найдена")
+            return
+        student_id, meeting_name, filler_nickname = row
 
         feedback_data = {
             "parent": {"database_id": NOTION_FEEDBACK_DB_ID},
@@ -513,7 +653,6 @@ class FeedbackBot:
                 "[6] IMPROVEMENT": {"number": answers.get(6, 0)},
                 "Filler Name": {"rich_text": [{"text": {"content": filler_nickname or "Unknown"}}]},
                 "Date": {"date": {"start": datetime.now().isoformat()}},
-                #"Meeting Name": {"title": [{"text": {"content": meeting_name}}]},
                 "TG_CHAT_ID": {"title": [{"text": {"content": chat_id}}]}
             }
         }
@@ -541,27 +680,35 @@ class FeedbackBot:
                 if response.status != 200:
                     error_data = await response.json()
                     logger.error(f"Ошибка обновления встречи: {error_data}")
+                    await self.send_telegram_message(ERRORLOG_CHAT_ID,
+                                                     f"Ошибка обновления встречи: {error_data}")
             try:
-                with sqlite3.connect("feedback.db") as conn:
-                    conn.execute(
-                        "DELETE FROM questionnaires WHERE meeting_id = ?",
-                        (meeting_id,)
-                    )
-                    conn.commit()
-                    logger.info(f"Удалена запись из questionnaires для meeting_id {meeting_id}")
-            except sqlite3.Error as e:
+                await self.db_worker.execute(DBWorker._delete_completed_questionnaire, meeting_id)
+                logger.info(f"Удалена запись из questionnaires для meeting_id {meeting_id}")
+            except Exception as e:
                 logger.error(f"Ошибка удаления из questionnaires: {e}")
 
     async def run_notion_checker(self):
         """Фоновая проверка завершенных встреч"""
 
         while True:
-
+            error_meeting_ids = []  # Список для хранения chat_id с ошибками
             try:
                 meetings = await self.fetch_notion_meetings()
                 logger.info(f"Найдено {len(meetings)} встреч для обработки")
                 for meeting in meetings:
-                    await self.process_meeting(meeting)
+                    await self.process_meeting(meeting, error_meeting_ids)
+
+                # 📩 Отправка ошибки, если были неудачи
+                if error_meeting_ids:
+                    error_list = '\n'.join([f"• {chat_id}" for chat_id in error_meeting_ids])
+                    error_message = (
+                        "⚠️ CHECK STUDENT'S CHAT_IDS: (FROM NEW BOT👋)\n"
+                        "━━━━━━━━━━━\n\n"
+                        f"{error_list}\n\n"
+
+                    )
+                    await self.send_telegram_message(ERROR_CHAT_ID, error_message)
             except Exception as e:
                 logger.error(f"Ошибка в notion_checker: {e}")
 
@@ -571,30 +718,17 @@ class FeedbackBot:
         """Фоновая отправка напоминаний"""
         while True:
             try:
-                with sqlite3.connect("feedback.db") as conn:
-                    cursor = conn.execute(
-                        "SELECT chat_id, meeting_id, meeting_name, last_message_id FROM questionnaires WHERE status in ('pending', 'in_progress')"
-                    )
-                    pending = cursor.fetchall()
-                    logger.info(f"Найдено {len(pending)} анкет со статусом 'pending' или 'in_progress'")
-                    for chat_id, meeting_id, meeting_name, last_message_id in pending:
-                        if last_message_id:
-                            await self.delete_telegram_message(chat_id, last_message_id)
-                        # Получаем имя ментора из Notion по meeting_id
-                        mentor_name = await self.get_mentor_name_from_notion(meeting_id)
-                        # Сбрасываем поля started_by и filler_nickname в NULL
-                        conn.execute(
-                            "UPDATE questionnaires SET started_by = NULL, filler_nickname = NULL, status = 'pending', answers = '{}' WHERE chat_id = ? AND meeting_id = ?",
-                            (chat_id, meeting_id)
-                        )
-                        # Отправляем сообщение с реальными meeting_name и mentor_name
-                        message_id = await self.send_initial_message(chat_id, meeting_name, mentor_name)
-                        # Обновляем last_message_id
-                        conn.execute(
-                            "UPDATE questionnaires SET last_message_id = ? WHERE chat_id = ? AND meeting_id = ?",
-                            (message_id, chat_id, meeting_id)
-                        )
-                        conn.commit()
+                pending = await self.db_worker.execute(DBWorker._get_pending_questionnaires)
+                logger.info(f"Найдено {len(pending)} анкет со статусом 'pending' или 'in_progress'")
+                for chat_id, meeting_id, meeting_name, last_message_id in pending:
+                    if last_message_id:
+                        await self.delete_telegram_message(chat_id, last_message_id)
+                    # Получаем имя ментора из Notion по meeting_id
+                    mentor_name = await self.get_mentor_name_from_notion(meeting_id)
+                    # Отправляем сообщение с реальными meeting_name и mentor_name
+                    message_id = await self.send_initial_message(chat_id, meeting_name, mentor_name)
+                    # Обновляем last_message_id
+                    await self.db_worker.execute(DBWorker._reset_questionnaire, chat_id, meeting_id, message_id)
             except Exception as e:
                 logger.error(f"Ошибка в reminder_checker: {e}")
             await asyncio.sleep(REMINDER_INTERVAL)
@@ -629,9 +763,39 @@ class FeedbackBot:
             async with session.post(url, json=payload) as response:
                 return await response.json()
 
+    async def send_survey_to_all_chats(self, message_text="""
+    Эта форма ежемесячной обратной связи по работе консалтинга в Impact Admissions. Пожалуйста, ответьте на все вопросы максимально честно, чтобы мы были в курсе существующих проблем и имели возможность решить их. Спасибо что являетесь нашими клиентами :)
+    """):
+        # Ссылка для кнопки
+        survey_url = "https://docs.google.com/forms/d/e/1FAIpQLSdhweVaIdLyUVWLejLxv2hta0cZAgnMMuR8IJM5Ho_uIOKGkg/viewform?usp=sharing&ouid=106831552632434519747"
+
+        # Клавиатура с кнопкой
+        keyboard = {
+            "inline_keyboard": [
+                [
+                    {
+                        "text": "⏭️ Продолжить (нажимает клиент)",
+                        "url": survey_url
+                    }
+                ]
+            ]
+        }
+
+        # Получаем все chat_id из базы
+        chat_ids = await self.db_worker.execute(DBWorker._get_all_chat_ids)
+
+        # Отправляем сообщение каждому chat_id
+        for chat_id in chat_ids:
+            try:
+                await self.send_telegram_message(chat_id, message_text.strip(), keyboard)
+            except Exception as e:
+                print(f"Не удалось отправить в чат {chat_id}: {e}")
+
     async def run_telegram_polling(self):
         """Polling для обновлений Telegram"""
         offset = 0
+        ALLOWED_USER_ID = 931138429  # <-- Заменить на свой user_id
+
         while True:
             try:
                 updates = await self.get_telegram_updates(offset)
@@ -644,8 +808,42 @@ class FeedbackBot:
                         if 'text' in message and message['text'].strip() == '/chat_id@Impact_FeedbackBot':
                             chat_id = message['chat']['id']
                             await self.send_telegram_message(chat_id, f"ID чата: {chat_id}")
+                        #if 'text' in message and message['text'].strip() == '/setchat_id@Impact_FeedbackBot':
+                        if 'text' in message and message['text'].strip() == '/setchat_id@Feedback_Impact_bot':
+                            user_id = message['from']['id']
+                            chat_id = message['chat']['id']
+                            command_message_id = message['message_id']  # ID исходного сообщения
+
+                            if user_id == ALLOWED_USER_ID:
+                                sent = await self.send_telegram_message(chat_id,
+                                                                        f"ID чата: {chat_id} (доступ разрешён)")
+                                await self.db_worker.execute(DBWorker._save_chat_id, chat_id)
+                                # Получаем message_id отправленного ботом сообщения
+                                answer_message_id = sent['result']['message_id'] if isinstance(sent,
+                                                                                               dict) else sent.message_id
+                            else:
+                                sent = await self.send_telegram_message(chat_id, "⛔ У вас нет доступа к этой команде.")
+                                answer_message_id = sent['result']['message_id'] if isinstance(sent,
+                                                                                               dict) else sent.message_id
+
+                            # Ждём 2 секунды и удаляем оба сообщения
+                            await asyncio.sleep(1)
+                            await self.delete_telegram_message(chat_id, answer_message_id)
+                            await self.delete_telegram_message(chat_id, command_message_id)
+
+                        if 'text' in message and (message['text'].strip() == '/start_nps@Impact_FeedbackBot' or message['text'].strip() == '/start_nps'):
+                            user_id = message['from']['id']
+                            chat_id = message['chat']['id']
+
+                            if user_id == ALLOWED_USER_ID:
+                                await self.send_survey_to_all_chats()
+                                sent = await self.send_telegram_message(chat_id, "Опрос разослан во все чаты.")
+                            else:
+                                sent = await self.send_telegram_message(chat_id, "⛔ У вас нет доступа к этой команде.")
+
             except Exception as e:
                 logger.error(f"Ошибка в run_telegram_polling: {e}")
+                await self.send_telegram_message(ERRORLOG_CHAT_ID, f"Ошибка в run_telegram_polling: {e}")
                 await asyncio.sleep(5)  # Задержка перед повторной попыткой
 
     async def get_telegram_updates(self, offset):
@@ -658,6 +856,8 @@ class FeedbackBot:
                     return data.get('result', [])
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             logger.error(f"Ошибка при получении обновлений от Telegram: {e}")
+            await self.send_telegram_message(ERRORLOG_CHAT_ID,
+                                             f"Error when receiving updates from Telegram: {e}")
             return []  # Возвращаем пустой список, чтобы цикл продолжился
 
     async def get_meeting_summary(self, meeting_id):
