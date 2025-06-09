@@ -275,7 +275,7 @@ class FeedbackBot:
             "Content-Type": "application/json"
         }
         today = datetime.now().isoformat()
-        fourteen_days_ago = (datetime.now() - timedelta(days=1)).isoformat()
+        fourteen_days_ago = (datetime.now() - timedelta(days=14)).isoformat()
 
         payload = {
             "filter": {
@@ -701,14 +701,14 @@ class FeedbackBot:
 
                 # 📩 Отправка ошибки, если были неудачи
                 if error_meeting_ids:
-                    error_list = '\n'.join([f"• {chat_id}" for chat_id in error_meeting_ids])
+                    error_list = '\n'.join([f"{i + 1}. {chat_id}" for i, chat_id in enumerate(error_meeting_ids)])
                     error_message = (
-                        "⚠️ CHECK STUDENT'S CHAT_IDS: (FROM NEW BOT👋)\n"
+                        "⚠️ CHECK STUDENT'S CHAT_IDS: \n"
                         "━━━━━━━━━━━\n\n"
                         f"{error_list}\n\n"
-
                     )
                     await self.send_telegram_message(ERROR_CHAT_ID, error_message)
+
             except Exception as e:
                 logger.error(f"Ошибка в notion_checker: {e}")
 
@@ -763,9 +763,15 @@ class FeedbackBot:
             async with session.post(url, json=payload) as response:
                 return await response.json()
 
-    async def send_survey_to_all_chats(self, message_text="""
-    Эта форма ежемесячной обратной связи по работе консалтинга в Impact Admissions. Пожалуйста, ответьте на все вопросы максимально честно, чтобы мы были в курсе существующих проблем и имели возможность решить их. Спасибо что являетесь нашими клиентами :)
-    """):
+    async def send_survey_to_all_chats():
+        emojis = ["😊", "😄", "😃", "😆", "😇", "😉", "🤩", "🥳", "😍", "🥰", "🙂", "🤗"]
+        random_emoji = random.choice(emojis)
+
+        message_text = f"""
+            Эта форма предназначена для ежемесячной обратной связи по работе консалтинга в Impact Admissions. \n
+            Пожалуйста, ответьте на все вопросы максимально честно, чтобы мы были в курсе существующих проблем и могли их решить. \n\n
+            Спасибо, что являетесь нашими клиентами {random_emoji} 
+            """
         # Ссылка для кнопки
         survey_url = "https://docs.google.com/forms/d/e/1FAIpQLSdhweVaIdLyUVWLejLxv2hta0cZAgnMMuR8IJM5Ho_uIOKGkg/viewform?usp=sharing&ouid=106831552632434519747"
 
@@ -794,7 +800,7 @@ class FeedbackBot:
     async def run_telegram_polling(self):
         """Polling для обновлений Telegram"""
         offset = 0
-        ALLOWED_USER_ID = 931138429  # <-- Заменить на свой user_id
+        ALLOWED_USER_ID = 834748098  # <-- Заменить на свой user_id
 
         while True:
             try:
@@ -807,29 +813,29 @@ class FeedbackBot:
                         message = update['message']
                         if 'text' in message and message['text'].strip() == '/chat_id@Impact_FeedbackBot':
                             chat_id = message['chat']['id']
+                            await self.db_worker.execute(DBWorker._save_chat_id, chat_id)
                             await self.send_telegram_message(chat_id, f"ID чата: {chat_id}")
-                        #if 'text' in message and message['text'].strip() == '/setchat_id@Impact_FeedbackBot':
-                        if 'text' in message and message['text'].strip() == '/setchat_id@Feedback_Impact_bot':
-                            user_id = message['from']['id']
-                            chat_id = message['chat']['id']
-                            command_message_id = message['message_id']  # ID исходного сообщения
-
-                            if user_id == ALLOWED_USER_ID:
-                                sent = await self.send_telegram_message(chat_id,
-                                                                        f"ID чата: {chat_id} (доступ разрешён)")
-                                await self.db_worker.execute(DBWorker._save_chat_id, chat_id)
-                                # Получаем message_id отправленного ботом сообщения
-                                answer_message_id = sent['result']['message_id'] if isinstance(sent,
-                                                                                               dict) else sent.message_id
-                            else:
-                                sent = await self.send_telegram_message(chat_id, "⛔ У вас нет доступа к этой команде.")
-                                answer_message_id = sent['result']['message_id'] if isinstance(sent,
-                                                                                               dict) else sent.message_id
-
-                            # Ждём 2 секунды и удаляем оба сообщения
-                            await asyncio.sleep(1)
-                            await self.delete_telegram_message(chat_id, answer_message_id)
-                            await self.delete_telegram_message(chat_id, command_message_id)
+                        # if 'text' in message and message['text'].strip() == '/setchat_id@Impact_FeedbackBot':
+                        #     user_id = message['from']['id']
+                        #     chat_id = message['chat']['id']
+                        #     command_message_id = message['message_id']  # ID исходного сообщения
+                        #
+                        #     if user_id == ALLOWED_USER_ID:
+                        #         sent = await self.send_telegram_message(chat_id,
+                        #                                                 f"ID чата: {chat_id} (сохранено для nps)")
+                        #         await self.db_worker.execute(DBWorker._save_chat_id, chat_id)
+                        #         # Получаем message_id отправленного ботом сообщения
+                        #         answer_message_id = sent['result']['message_id'] if isinstance(sent,
+                        #                                                                        dict) else sent.message_id
+                        #     else:
+                        #         sent = await self.send_telegram_message(chat_id, "⛔ У вас нет доступа к этой команде.")
+                        #         answer_message_id = sent['result']['message_id'] if isinstance(sent,
+                        #                                                                        dict) else sent.message_id
+                        #
+                        #     # Ждём 2 секунды и удаляем оба сообщения
+                        #     await asyncio.sleep(1)
+                        #     await self.delete_telegram_message(chat_id, answer_message_id)
+                        #     await self.delete_telegram_message(chat_id, command_message_id)
 
                         if 'text' in message and (message['text'].strip() == '/start_nps@Impact_FeedbackBot' or message['text'].strip() == '/start_nps'):
                             user_id = message['from']['id']
