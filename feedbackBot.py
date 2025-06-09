@@ -359,26 +359,32 @@ class FeedbackBot:
             logger.error(f"Отсутствует TG_CHAT_ID для meeting_id {meeting_id}")
             await self.send_telegram_message(ERRORLOG_CHAT_ID, f"Отсутствует студент для meeting_id {meeting_id}")
             return
-        chat_id = str(chat_id_array[0]['number'])
+        # chat_id = str(chat_id_array[0]['number'])
+        # print(chat_id_array)
 
-        if await self.is_meeting_processed(meeting_id):
-            return
+        for chat_obj in chat_id_array:
+            # Получаем chat_id как строку
+            chat_id = str(chat_obj['number'])
+            print(chat_id)
 
-        # Сохраняем анкету
-        await self.save_questionnaire(chat_id, meeting_id, meeting_name, mentor_name, student_id)
-        logger.info(f"Сохранена новая анкета для chat_id {chat_id}, meeting_id {meeting_id}")
+            if await self.is_meeting_processed(meeting_id):
+                return
 
-        # Отправляем начальное сообщение с обработкой ошибок
-        try:
-            message_id = await self.send_initial_message(chat_id, meeting_name, mentor_name)
-            await self.db_worker.execute(DBWorker._update_last_message_id, chat_id, meeting_id, message_id)
-        except Exception as e:
-            logger.error(
-                f"Ошибка при отправке начального сообщения для chat_id {chat_id}, meeting_id {meeting_id}: {e}")
-            error_meeting_ids.append(f"<a href='https://www.notion.so/impactadmissions/{meeting_id.replace('-', '')}'>{meeting_name}</a>")
-            # Удаляем запись из базы данных в случае ошибки
-            await self.db_worker.execute(DBWorker._delete_questionnaire, chat_id, meeting_id)
-            return
+            # Сохраняем анкету
+            await self.save_questionnaire(chat_id, meeting_id, meeting_name, mentor_name, student_id)
+            logger.info(f"Сохранена новая анкета для chat_id {chat_id}, meeting_id {meeting_id}")
+
+            # Отправляем начальное сообщение с обработкой ошибок
+            try:
+                message_id = await self.send_initial_message(chat_id, meeting_name, mentor_name, meeting_id)
+                await self.db_worker.execute(DBWorker._update_last_message_id, chat_id, meeting_id, message_id)
+            except Exception as e:
+                logger.error(
+                    f"Ошибка при отправке начального сообщения для chat_id {chat_id}, meeting_id {meeting_id}: {e}")
+                error_meeting_ids.append(f"<a href='https://www.notion.so/impactadmissions/{meeting_id.replace('-', '')}'>{meeting_name}</a>")
+                # Удаляем запись из базы данных в случае ошибки
+                await self.db_worker.execute(DBWorker._delete_questionnaire, chat_id, meeting_id)
+                return
 
         # Отмечаем встречу как обработанную
         await self.mark_meeting_processed(meeting_id)
@@ -418,7 +424,7 @@ class FeedbackBot:
     async def save_questionnaire(self, chat_id, meeting_id, meeting_name, mentor_name, student_id):
         await self.db_worker.execute(DBWorker._save_questionnaire, chat_id, meeting_id, meeting_name, student_id)
 
-    async def send_initial_message(self, chat_id, meeting_name, mentor_name):
+    async def send_initial_message(self, chat_id, meeting_name, mentor_name, meeting_id):
         """Отправка начального сообщения с кнопкой 'Начать'"""
 
         # Получаем дату встречи
@@ -430,13 +436,21 @@ class FeedbackBot:
         keyboard = {
             "inline_keyboard": [[{
                 "text": "⏭️ Продолжить (нажимает клиент)",
-                "callback_data": f"start,{chat_id},{meeting_name}"
+                "callback_data": f"start,{chat_id},{meeting_id}"
             }]]
         }
         message_text = (
             f"Пожалуйста оставьте обратную связь по данной встрече: \n\n<b>>> {meeting_name}</b>\nDate: {finalDate}\nMentor: {mentor_name}\n\n\n"
         )
         message = await self.send_telegram_message(chat_id, message_text, keyboard)
+
+        # Добавим логирование полного ответа
+        logger.debug(f"Ответ Telegram API: {message}")
+
+        if 'result' not in message:
+            raise Exception(
+                f"Ошибка Telegram API: {message.get('description', 'Нет описания ошибки')}, полный ответ: {message}")
+
         return message['result']['message_id']
 
     async def get_meeting_date(self, meeting_name):
@@ -510,12 +524,12 @@ class FeedbackBot:
 
         if action == "start":
             chat_id = data[1]
-            meeting_name = data[2] if len(data) > 2 else ""
+            meeting_id = data[2]
             user_id = callback_query['from']['id']  # Получаем Telegram user_id
-            user_nickname = callback_query['from'].get('username', callback_query['from'].get('first_name',
-                                                                                              'Unknown'))  # Никнейм или имя
-            await self.start_questionnaire(chat_id, meeting_name, callback_query['message']['message_id'], user_id,
+            user_nickname = callback_query['from'].get('username', callback_query['from'].get('first_name', 'Unknown'))
+            await self.start_questionnaire(chat_id, meeting_id, callback_query['message']['message_id'], user_id,
                                            user_nickname)
+
         elif action == "answer":
             chat_id = data[1]
             meeting_id = data[2]
@@ -524,14 +538,11 @@ class FeedbackBot:
             user_id = callback_query['from']['id']  # Получаем user_id для проверки
             await self.process_answer(chat_id, question_num, points, callback_query['message']['message_id'], user_id, callback_query['id'])
 
-    async def start_questionnaire(self, chat_id, meeting_name, message_id, user_id, user_nickname):
-        """Начало анкеты: отправка первого вопроса"""
-        meeting_id = await self.db_worker.execute(DBWorker._get_meeting_for_start, chat_id)
-        if meeting_id:
-            await self.db_worker.execute(DBWorker._start_questionnaire_update, chat_id, meeting_id, user_id, user_nickname)
-            keyboard = self.generate_question_keyboard(1, chat_id, meeting_id)
-            question_text = self.get_question_text(1)
-            await self.edit_telegram_message(chat_id, message_id, question_text, keyboard)
+    async def start_questionnaire(self, chat_id, meeting_id, message_id, user_id, user_nickname):
+        await self.db_worker.execute(DBWorker._start_questionnaire_update, chat_id, meeting_id, user_id, user_nickname)
+        keyboard = self.generate_question_keyboard(1, chat_id, meeting_id)
+        question_text = self.get_question_text(1)
+        await self.edit_telegram_message(chat_id, message_id, question_text, keyboard)
 
     def update_questionnaire_status(self, chat_id, meeting_id, status, current_question):
         """Обновление статуса анкеты"""
@@ -726,7 +737,7 @@ class FeedbackBot:
                     # Получаем имя ментора из Notion по meeting_id
                     mentor_name = await self.get_mentor_name_from_notion(meeting_id)
                     # Отправляем сообщение с реальными meeting_name и mentor_name
-                    message_id = await self.send_initial_message(chat_id, meeting_name, mentor_name)
+                    message_id = await self.send_initial_message(chat_id, meeting_name, mentor_name, meeting_id)
                     # Обновляем last_message_id
                     await self.db_worker.execute(DBWorker._reset_questionnaire, chat_id, meeting_id, message_id)
             except Exception as e:
