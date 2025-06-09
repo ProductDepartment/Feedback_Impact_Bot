@@ -774,19 +774,20 @@ class FeedbackBot:
             async with session.post(url, json=payload) as response:
                 return await response.json()
 
-    async def send_survey_to_all_chats():
+    from datetime import datetime, timedelta
+
+    async def send_survey_to_all_chats(self):
+        """
+        Парсит митинги из Notion за последний месяц и рассылает Google Form по чатам.
+        """
         emojis = ["😊", "😄", "😃", "😆", "😇", "😉", "🤩", "🥳", "😍", "🥰", "🙂", "🤗"]
         random_emoji = random.choice(emojis)
-
-        message_text = f"""
-            Эта форма предназначена для ежемесячной обратной связи по работе консалтинга в Impact Admissions. \n
-            Пожалуйста, ответьте на все вопросы максимально честно, чтобы мы были в курсе существующих проблем и могли их решить. \n\n
-            Спасибо, что являетесь нашими клиентами {random_emoji} 
-            """
-        # Ссылка для кнопки
+        message_text = (
+            "Эта форма предназначена для ежемесячной обратной связи по работе консалтинга в Impact Admissions.\n"
+            "Пожалуйста, ответьте на все вопросы максимально честно, чтобы мы были в курсе существующих проблем и могли их решить.\n\n"
+            f"Спасибо, что являетесь нашими клиентами {random_emoji}"
+        )
         survey_url = "https://docs.google.com/forms/d/e/1FAIpQLSdhweVaIdLyUVWLejLxv2hta0cZAgnMMuR8IJM5Ho_uIOKGkg/viewform?usp=sharing&ouid=106831552632434519747"
-
-        # Клавиатура с кнопкой
         keyboard = {
             "inline_keyboard": [
                 [
@@ -798,15 +799,57 @@ class FeedbackBot:
             ]
         }
 
-        # Получаем все chat_id из базы
-        chat_ids = await self.db_worker.execute(DBWorker._get_all_chat_ids)
+        # 1. Получаем встречи за последний месяц из Notion
+        headers = {
+            "Authorization": f"Bearer {NOTION_API_KEY}",
+            "Notion-Version": "2022-06-28",
+            "Content-Type": "application/json"
+        }
+        today = datetime.now().date().isoformat()
+        month_ago = (datetime.now() - timedelta(days=40)).date().isoformat()
+        payload = {
+            "filter": {
+                "and": [
+                    {"property": "Status", "status": {"equals": "Done"}},
+                    {"property": "Date", "date": {"on_or_after": month_ago}},
+                    {"property": "Date", "date": {"on_or_before": today}}
+                ]
+            }
+        }
 
-        # Отправляем сообщение каждому chat_id
+        chat_ids = set()
+        # 2. Делаем запрос к Notion API
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                    f"https://api.notion.com/v1/databases/{NOTION_MEETINGS_DB_ID}/query",
+                    headers=headers, json=payload
+            ) as response:
+                if response.status != 200:
+                    logger.error(f"Ошибка Notion API: {response.status} {await response.text()}")
+                    await self.send_telegram_message(ERRORLOG_CHAT_ID, f"Ошибка получения митингов: {response.status}")
+                    return
+                data = await response.json()
+                meetings = data.get("results", [])
+
+        # 3. Собираем все chat_id из митингов (ключ TG_CHAT_ID)
+        for meeting in meetings:
+            properties = meeting.get("properties", {})
+            chat_id_array = properties.get('TG_CHAT_ID', {}).get('rollup', {}).get('array', [])
+            for chat_obj in chat_id_array:
+                if isinstance(chat_obj, dict) and 'number' in chat_obj:
+                    chat_ids.add(str(chat_obj['number']))
+
+        # 4. Рассылаем форму всем chat_id
+        if not chat_ids:
+            logger.warning("Не найдено ни одного TG_CHAT_ID для рассылки формы")
+            await self.send_telegram_message(ERRORLOG_CHAT_ID, "Не найдено ни одного TG_CHAT_ID для рассылки формы")
+            return
+
         for chat_id in chat_ids:
             try:
                 await self.send_telegram_message(chat_id, message_text.strip(), keyboard)
             except Exception as e:
-                print(f"Не удалось отправить в чат {chat_id}: {e}")
+                logger.error(f"Не удалось отправить форму в чат {chat_id}: {e}")
 
     async def run_telegram_polling(self):
         """Polling для обновлений Telegram"""
@@ -824,7 +867,6 @@ class FeedbackBot:
                         message = update['message']
                         if 'text' in message and message['text'].strip() == '/chat_id@Impact_FeedbackBot':
                             chat_id = message['chat']['id']
-                            await self.db_worker.execute(DBWorker._save_chat_id, chat_id)
                             await self.send_telegram_message(chat_id, f"ID чата: {chat_id}")
                         # if 'text' in message and message['text'].strip() == '/setchat_id@Impact_FeedbackBot':
                         #     user_id = message['from']['id']
