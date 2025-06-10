@@ -10,6 +10,9 @@ import json
 from notion_client import Client
 from datetime import datetime
 import random
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+
 
 class DBWorker:
     def __init__(self, db_path="feedback.db"):
@@ -239,6 +242,11 @@ NOTION_FEEDBACK_DB_ID = os.getenv("NOTION_FEEDBACK_DB_ID")
 ERROR_CHAT_ID = os.getenv("ERROR_CHAT_ID")
 ERRORLOG_CHAT_ID = os.getenv("ERRORLOG_CHAT_ID")
 
+CLIENTS_DATABASE_ID = "0b4d47f89b8043e195eb77c804fcc363"
+TASKS_DATABASE_ID = "951c13ef06a348c48bb1c2e844735e09"
+MEETINGS_CALENDAR_ID = "feb59dc9a0984f93a9ff6b849ebb2200"
+APPLICATIONS_DATABASE_ID = "0fd45da7bfbe4bd385419e49327bef9d"
+
 
 
 # Константы
@@ -246,10 +254,13 @@ POLLING_INTERVAL = 60 * 60 * 5   # 8 часов в секундах
 REMINDER_INTERVAL = 60 * 60 * 8  # 8 часов в секундах
 
 class FeedbackBot:
+
     def __init__(self):
         self.notion = Client(auth=NOTION_API_KEY)
         self.db_worker = DBWorker()
         logger.info("Бот инициализирован")
+        self.scheduler = AsyncIOScheduler()
+        self.scheduler.add_job(self.daily_fix_report_async, 'cron', hour=15, minute=0)
 
     async def init_database(self):
         """Инициализация базы данных SQLite"""
@@ -261,6 +272,7 @@ class FeedbackBot:
         logger.info("Запуск бота")
         await self.db_worker.start()
         await self.init_database()
+        self.scheduler.start()
         tasks = [
             asyncio.create_task(self.run_notion_checker()),
             asyncio.create_task(self.run_reminder_checker()),
@@ -714,7 +726,7 @@ class FeedbackBot:
                 if error_meeting_ids:
                     error_list = '\n'.join([f"{i + 1}. {chat_id}" for i, chat_id in enumerate(error_meeting_ids)])
                     error_message = (
-                        "⚠️ CHECK STUDENT'S CHAT_IDS: \n"
+                        "<b>⚠️ CHECK STUDENT'S CHAT_IDS:</b> \n"
                         "━━━━━━━━━━━\n\n"
                         f"{error_list}\n\n"
                     )
@@ -867,7 +879,7 @@ class FeedbackBot:
                         message = update['message']
                         if 'text' in message and message['text'].strip() == '/chat_id@Impact_FeedbackBot':
                             chat_id = message['chat']['id']
-                            await self.send_telegram_message(chat_id, f"ID чата: {chat_id}")
+                            await self.send_telegram_message(chat_id, f"ID чата: <code>{chat_id}</code>")
                         # if 'text' in message and message['text'].strip() == '/setchat_id@Impact_FeedbackBot':
                         #     user_id = message['from']['id']
                         #     chat_id = message['chat']['id']
@@ -935,6 +947,183 @@ class FeedbackBot:
                     summary_text = ''.join([text['plain_text'] for text in summary_property['rich_text']])
                     return summary_text
                 return None
+
+    @staticmethod
+    async def database_query_all(database_id: str, headers, payload, stop=None) -> dict:
+        """Асинхронно получить все записи из Notion-базы с повторными попытками при 504 ошибке."""
+        url_base = f'https://api.notion.com/v1/databases/{database_id}/query'
+
+        async def query_database(session, start_cursor=None):
+            payload_copy = payload.copy()
+            payload_copy['page_size'] = 50  # Снизим нагрузку
+            if start_cursor:
+                payload_copy['start_cursor'] = start_cursor
+
+            max_retries = 4
+            base_delay = 2
+
+            for attempt in range(max_retries):
+                try:
+                    async with session.post(url_base, json=payload_copy, headers=headers,
+                                            timeout=aiohttp.ClientTimeout(total=60)) as response:
+                        if response.status == 504:
+                            if attempt < max_retries - 1:
+                                delay = base_delay * (2 ** attempt)
+                                print(
+                                    f"Notion API вернул 504. Повтор через {delay} сек... (Попытка {attempt + 1}/{max_retries})")
+                                await asyncio.sleep(delay)
+                                continue
+                            else:
+                                print(f"504 после {max_retries} попыток.")
+                                response.raise_for_status()
+                        response.raise_for_status()
+                        print(f"Notion API Response Status: {response.status}")
+                        return await response.json()
+                except aiohttp.ClientError as e:
+                    print(f"Ошибка запроса: {e}")
+                    if attempt < max_retries - 1:
+                        delay = base_delay * (2 ** attempt)
+                        print(f"Повтор через {delay} сек... (Попытка {attempt + 1}/{max_retries})")
+                        await asyncio.sleep(delay)
+                    else:
+                        print("Все попытки исчерпаны.")
+                        raise
+
+            raise Exception("Не удалось получить данные из Notion после всех попыток.")
+
+
+        results = []
+        has_more = True
+        next_cursor = None
+
+        async with aiohttp.ClientSession() as session:
+            data = await query_database(session)
+            results.extend(data.get('results', []))
+            has_more = data.get('has_more', False)
+            next_cursor = data.get('next_cursor')
+
+            while has_more:
+                if stop is not None and len(results) >= stop:
+                    break
+                data_page = await query_database(session, start_cursor=next_cursor)
+                results.extend(data_page.get('results', []))
+                has_more = data_page.get('has_more', False)
+                next_cursor = data_page.get('next_cursor')
+
+        return {
+            'results': results,
+            'next_cursor': next_cursor,
+            'has_more': has_more
+        }
+
+    async def fixClients(self):
+        global message
+        #view_url = "https://www.notion.so/impactadmissions/0b4d47f89b80443eab63238617844eea7&pvs=4"
+        view_url = "https://www.notion.so/impactadmissions/0b4d47f89b8043e195eb77c804fcc363?v=2ca1b22cb6ce43eab63238617844eea7&pvs=4"
+        headers = {
+            "Authorization": f"Bearer {NOTION_API_KEY}",
+            "Notion-Version": "2022-06-28",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "filter": {
+                "property": "FIX?",
+                "formula": {
+                    "checkbox": {
+                        "equals": True
+                    }
+                }
+            }
+        }
+        fix_clients_entries = await self.database_query_all(CLIENTS_DATABASE_ID, headers, payload, 300)
+        if (len(fix_clients_entries["results"]) > 0):
+            message += f'❌ <a href = "{view_url}">clients database</a> – {len(fix_clients_entries["results"])}+ page(s) broken' + "\n"
+        else:
+            message += f'✅ <a href = "{view_url}">clients database</a> – in order' + "\n"
+
+    async def fixTasks(self):
+        global message
+        view_url = "https://www.notion.so/impactadmissions/951c13ef06a348c48bb1c2e844735e09?v=ddad176a96a94d1991271cf904087cf1&pvs=4"
+        headers = {
+            "Authorization": f"Bearer {NOTION_API_KEY}",
+            "Notion-Version": "2022-06-28",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "filter": {
+                "property": "FIX?",
+                "formula": {
+                    "checkbox": {
+                        "equals": True
+                    }
+                }
+            }
+        }
+        fix_tasks_entries = await self.database_query_all(TASKS_DATABASE_ID, headers, payload, 300)
+        if (len(fix_tasks_entries["results"]) > 0):
+            message += f'❌ <a href = "{view_url}">student tasks</a> – {len(fix_tasks_entries["results"])}+ page(s) broken' + "\n"
+        else:
+            message += f'✅ <a href = "{view_url}">student tasks</a> – in order' + "\n"
+
+    async def fixMeetings(self):
+        global message
+        view_url = "https://www.notion.so/impactadmissions/feb59dc9a0984f93a9ff6b849ebb2200?v=11e85a1d433643678fa66b9c25daf9a1&pvs=4"
+        headers = {
+            "Authorization": f"Bearer {NOTION_API_KEY}",
+            "Notion-Version": "2022-06-28",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "filter": {
+                "property": "FIX?",
+                "formula": {
+                    "checkbox": {
+                        "equals": True
+                    }
+                }
+            }
+        }
+        fix_meetings_entries = await self.database_query_all(MEETINGS_CALENDAR_ID, headers, payload, 300)
+        if (len(fix_meetings_entries["results"]) > 0):
+            message += f'❌ <a href = "{view_url}">meetings calendar</a> – {len(fix_meetings_entries["results"])}+ page(s) broken' + "\n"
+        else:
+            message += f'✅ <a href = "{view_url}">meetings calendar</a> – in order' + "\n"
+
+    async def fixApplications(self):
+        global message
+        view_url = "https://www.notion.so/impactadmissions/0fd45da7bfbe4bd385419e49327bef9d?v=2d67dae6ac0a4fc18d1420c2a4fe41d9&pvs=4"
+        headers = {
+            "Authorization": f"Bearer {NOTION_API_KEY}",
+            "Notion-Version": "2022-06-28",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "filter": {
+                "property": "FIX?",
+                "formula": {
+                    "checkbox": {
+                        "equals": True
+                    }
+                }
+            }
+        }
+        fix_application_entries = await self.database_query_all(APPLICATIONS_DATABASE_ID, headers, payload, 300)
+        if (len(fix_application_entries["results"]) > 0):
+            message += f'❌ <a href = "{view_url}">university applications</a> – {len(fix_application_entries["results"])}+ page(s) broken' + "\n"
+        else:
+            message += f'✅ <a href = "{view_url}">university applications</a> – in order' + "\n"
+
+    async def daily_fix_report_async(self):
+        global message
+        message = """
+        <b>🚨️ SYSTEM HEALTH STATUS:</b> \n
+        ━━━━━━━━━━━\n\n
+        """
+        await self.fixClients()
+        await self.fixTasks()
+        await self.fixMeetings()
+        await self.fixApplications()
+        await self.send_telegram_message(ERROR_CHAT_ID,message)
 
 
 if __name__ == "__main__":
